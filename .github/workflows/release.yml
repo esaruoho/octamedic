@@ -4,6 +4,17 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.0.1)"
+        required: false
+        default: "v0.0.1-test"
+      publish:
+        description: "Create GitHub Release (true/false)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -13,7 +24,7 @@ env:
 
 jobs:
   test:
-    name: Test on ${{ matrix.os }}
+    name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -39,7 +50,7 @@ jobs:
         run: cargo test --workspace --locked
 
   build:
-    name: Build ${{ matrix.target }}
+    name: Build (${{ matrix.target }})
     needs: test
     runs-on: ${{ matrix.os }}
     strategy:
@@ -48,11 +59,7 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04-arm
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
-          - target: aarch64-pc-windows-msvc
             os: windows-latest
           - target: x86_64-apple-darwin
             os: macos-latest
@@ -79,23 +86,98 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} -p mmd_cli -p octamedic_gui
 
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      - name: Determine tag name
+        id: tag
+        shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          for pair in cli:mmd_cli gui:octamedic_gui; do
-            kind="${pair%%:*}"; bin="${pair#*:}"
-            zip "$GITHUB_WORKSPACE/octamedic-${kind}-${GITHUB_REF_NAME}-${{ matrix.target }}.zip" "$bin"
-          done
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
+      # macOS: Package OctaMEDIC.app bundle + CLI
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          TARGET_DIR="target/${{ matrix.target }}/release"
+          APP_DIR="$TARGET_DIR/OctaMEDIC.app"
+          CONTENTS="$APP_DIR/Contents"
+          MACOS="$CONTENTS/MacOS"
+          RESOURCES="$CONTENTS/Resources"
+
+          mkdir -p "$MACOS" "$RESOURCES"
+          cp "$TARGET_DIR/octamedic_gui" "$MACOS/octamedic_gui"
+          chmod +x "$MACOS/octamedic_gui"
+
+          cat << 'EOF' > "$CONTENTS/Info.plist"
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDevelopmentRegion</key>
+              <string>en</string>
+              <key>CFBundleExecutable</key>
+              <string>octamedic_gui</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.octamedic.octamedic</string>
+              <key>CFBundleInfoDictionaryVersion</key>
+              <string>6.0</string>
+              <key>CFBundleName</key>
+              <string>OctaMEDIC</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>0.0.1</string>
+              <key>CFBundleVersion</key>
+              <string>0.0.1</string>
+              <key>CFBundleIconFile</key>
+              <string>AppIcon</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+              <key>NSSupportsAutomaticGraphicsSwitching</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+          # Create icon from octamedic.png
+          if [ -f "octamedic.png" ]; then
+            ICONSET=$(mktemp -d)/OctaMEDIC.iconset
+            mkdir -p "$ICONSET"
+            SQUARE=$(mktemp -d)/sq.png
+            sips -c 1080 1080 octamedic.png --out "$SQUARE" >/dev/null 2>&1
+            for size in 16 32 128 256 512; do
+              sips -z $size $size "$SQUARE" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null 2>&1
+              sips -z $((size * 2)) $((size * 2)) "$SQUARE" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null 2>&1
+            done
+            iconutil -c icns "$ICONSET" -o "$RESOURCES/AppIcon.icns" || true
+          fi
+
+          cd "$TARGET_DIR"
+          zip -r "$GITHUB_WORKSPACE/octamedic-gui-${TAG}-${{ matrix.target }}.zip" "OctaMEDIC.app"
+          zip "$GITHUB_WORKSPACE/octamedic-cli-${TAG}-${{ matrix.target }}.zip" "mmd_cli"
+
+      # Linux: Package zip
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          cd target/${{ matrix.target }}/release
+          zip "$GITHUB_WORKSPACE/octamedic-gui-${TAG}-${{ matrix.target }}.zip" octamedic_gui
+          zip "$GITHUB_WORKSPACE/octamedic-cli-${TAG}-${{ matrix.target }}.zip" mmd_cli
+
+      # Windows: Package zip
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $tag = "${{ steps.tag.outputs.tag }}"
           $bins = @{ cli = "mmd_cli"; gui = "octamedic_gui" }
           foreach ($kind in $bins.Keys) {
-            $archive = "octamedic-$kind-$env:GITHUB_REF_NAME-${{ matrix.target }}.zip"
-            Compress-Archive -Path "target/${{ matrix.target }}/release/$($bins[$kind]).exe" -DestinationPath $archive
+            $archive = "octamedic-$kind-$tag-${{ matrix.target }}.zip"
+            Compress-Archive -Path "target/${{ matrix.target }}/release/$($bins[$kind]).exe" -DestinationPath "$env:GITHUB_WORKSPACE/$archive"
           }
 
       - uses: actions/upload-artifact@v4
@@ -107,13 +189,16 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.publish == 'true'
     steps:
       - uses: actions/checkout@v4
 
       - name: Extract changelog entry
         id: notes
         run: |
-          awk -v tag="$GITHUB_REF_NAME" '
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="$GITHUB_REF_NAME"
+          awk -v tag="$TAG" '
             /^## / { if (found) exit; found = ($2 == tag) ; next }
             found { print }
           ' docs/CHANGELOG.md 2>/dev/null > notes.md || true
@@ -130,6 +215,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
           files: dist/*.zip
           body_path: ${{ steps.notes.outputs.found == 'true' && 'notes.md' || '' }}
           generate_release_notes: ${{ steps.notes.outputs.found != 'true' }}
